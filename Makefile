@@ -1,6 +1,7 @@
 PROG := nlex
-CFLAGS := -fsanitize=address -Wall -g -Og
-LDFLAGS := 
+CFLAGS := -fsanitize=address,undefined -Wall -g -Og
+LDFLAGS :=
+CC := clang
 
 .PHONY: all
 all: $(PROG)
