@@ -11,6 +11,7 @@
 struct __attribute__((packed, aligned(4))) netlink_attr {
     struct nlattr hdr;
     union {
+        struct nlattr attrs[1];
         uint16_t u16;
         char s;
     };
@@ -24,7 +25,7 @@ struct __attribute__((packed, aligned(4))) netlink_message {
 
 static uint32_t seqn = 0;
 
-static struct netlink_message get_families_req() {
+static struct netlink_message families_req() {
     struct netlink_message cmd = {
         .hdr = {
             .nlmsg_len = sizeof cmd,
@@ -44,7 +45,8 @@ static struct netlink_message get_families_req() {
 }
 
 static void log_header(struct nlmsghdr *hdr) {
-    printf("l: %4u, t: %hu, f: %hx, s: %u, p: %u | ",
+    printf("-----------------------------------------------------------------\n");
+    printf("length: %4u, type: %hu, flags: 0x%hx, seq: %u, pid: %u",
         hdr->nlmsg_len,
         hdr->nlmsg_type,
         hdr->nlmsg_flags,
@@ -53,11 +55,17 @@ static void log_header(struct nlmsghdr *hdr) {
 }
 
 static void log_gen_header(struct genlmsghdr *hdr) {
-    printf("c: %hhu | ", hdr->cmd);
+    printf(", cmd: %hhu", hdr->cmd);
 }
 
 static void log_attr(struct nlattr *attr) {
-    printf("%hu %hu\n", attr->nla_type, attr->nla_len);
+    // printf("%hu %hu\n", attr->nla_type, attr->nla_len);
+
+    printf("0x");
+    for (int i = 0; i < attr->nla_len / sizeof (int); i++) {
+        printf("%08x|", ((unsigned *) attr)[i]);
+    }
+    printf("\n");
 }
 
 struct nl_resp_iter {
@@ -98,6 +106,61 @@ static bool next_message(struct netlink_message **msg, struct nl_resp_iter *iter
     return type != NLMSG_ERROR && type != NLMSG_DONE;
 }
 
+struct netlink_attr_iter {
+    uint32_t const len;
+    uint32_t n;
+    void *attrbuf;
+};
+
+static struct netlink_attr_iter netlink_attr_iter(void *attrs, uint32_t len) {
+    return (struct netlink_attr_iter) {
+        .attrbuf = attrs,
+        .len = len,
+        .n = 0
+    };
+}
+
+static bool next_netlink_attr(struct netlink_attr **attr, struct netlink_attr_iter *iter) {
+    if (iter->n >= iter->len) {
+        iter->n = 0;
+        return false;
+    }
+
+    *attr = iter->attrbuf + iter->n;
+    iter->n += NLA_ALIGN((*attr)->hdr.nla_len);
+    return true;
+}
+
+void log_ops(struct netlink_attr *ops) {
+    struct netlink_attr_iter ops_iter = netlink_attr_iter(ops->attrs,
+        ops->hdr.nla_len - offsetof(struct netlink_attr, attrs));
+    bool is_ops = ops->hdr.nla_type == CTRL_ATTR_OPS;
+
+    printf(is_ops ? "operations:\n" : "mcast groups\n");
+    while (next_netlink_attr(&ops, &ops_iter)) {
+        struct netlink_attr_iter attr_iter = netlink_attr_iter(ops->attrs,
+            ops->hdr.nla_len - offsetof(struct netlink_attr, attrs));
+        struct netlink_attr *attr = NULL;
+
+        printf("%3hu.", ops->hdr.nla_type);
+        while (next_netlink_attr(&attr, &attr_iter)) {
+            if (is_ops) {
+                if (attr->hdr.nla_type == CTRL_ATTR_OP_ID) {
+                    printf(" id: %3hu\n", attr->u16);
+                } else if (attr->hdr.nla_type == CTRL_ATTR_OP_FLAGS) {
+                    printf("     flags: 0x%hx\n", attr->u16);
+                }
+            } else {
+                if (attr->hdr.nla_type == CTRL_ATTR_MCAST_GRP_NAME) {
+                   printf("     name: %s\n", &attr->s);
+                } else if (attr->hdr.nla_type == CTRL_ATTR_MCAST_GRP_ID) {
+                    printf(" id: %3hu\n", attr->u16);
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
     if (sock == -1) {
@@ -105,7 +168,7 @@ int main(int argc, char *argv[]) {
         goto fail;
     }
 
-    struct netlink_message req = get_families_req();
+    struct netlink_message req = families_req();
 
     ssize_t sent = write(sock, &req, sizeof req);
     if (sent < 0) {
@@ -121,15 +184,12 @@ int main(int argc, char *argv[]) {
         log_gen_header(&msg->genhdr);
         printf("\n");
 
-        struct netlink_attr *attr = msg->attrs;
-        for (
-            uint32_t n = msg->hdr.nlmsg_len - offsetof(struct netlink_message, attrs);
-            n;
-            n -= NLA_ALIGN(attr->hdr.nla_len),
-            attr = (struct netlink_attr *) ((char *) attr + NLA_ALIGN(attr->hdr.nla_len))
-        ) {
-            // log_attr(&attr->hdr);
-            switch (attr->hdr.nla_type) {
+        struct netlink_attr *attr = NULL;
+        uint32_t attr_len = msg->hdr.nlmsg_len - offsetof(struct netlink_message, attrs);
+        struct netlink_attr_iter attr_iter = netlink_attr_iter(msg->attrs, attr_len);
+
+        while (next_netlink_attr(&attr, &attr_iter)) {
+            switch (attr->hdr.nla_type & NLA_TYPE_MASK) {
                 case CTRL_ATTR_FAMILY_ID:
                     printf("family id: %hu\n", attr->u16);
                     break;
@@ -146,10 +206,11 @@ int main(int argc, char *argv[]) {
                     printf("maxattr: %hu\n", attr->u16);
                     break;
                 case CTRL_ATTR_OPS:
-                    break;
                 case CTRL_ATTR_MCAST_GROUPS:
+                    log_ops(attr);
                     break;
-                case CTRL_ATTR_POLICY:
+                default:
+                    log_attr(&attr->hdr);
                     break;
             }
         }
